@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/agentflare-ai/jsonpointer"
+	"github.com/agentflare-ai/go-jsonpointer"
 )
 
 // Op represents JSON Patch operation types

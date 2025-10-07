@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agentflare-ai/jsonpatch"
+	"github.com/agentflare-ai/go-jsonpatch"
 )
 
 func TestApply(t *testing.T) {

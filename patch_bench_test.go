@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/agentflare-ai/jsonpatch"
+	"github.com/agentflare-ai/go-jsonpatch"
 )
 
 var baseDoc = `{
