@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/agentflare-ai/go-jsonpointer"
 )
@@ -30,6 +31,323 @@ type Operation struct {
 
 // Patch represents a collection of JSON Patch operations
 type Patch []Operation
+
+// Delta represents a single path change captured during Prepare.
+// Op is one of RFC6902 ops we materialize into deltas: add, remove, replace.
+// Move/copy expand into one or more add/remove deltas during preparation.
+type Delta struct {
+	Path          string `json:"path"`
+	Op            Op     `json:"op"`
+	Before        any    `json:"before,omitempty"`
+	After         any    `json:"after,omitempty"`
+	ExistedBefore bool   `json:"existed_before"`
+	ExistedAfter  bool   `json:"existed_after"`
+}
+
+// Diff encapsulates ordered deltas and precompiled forward/reverse patches.
+type Diff struct {
+	Deltas  []Delta `json:"deltas"`
+	forward Patch   `json:"-"`
+	reverse Patch   `json:"-"`
+}
+
+// Apply reproduces the patch effect on document using captured deltas.
+func (d Diff) Apply(document any) (any, error) {
+	return ApplyInPlace(document, d.forward)
+}
+
+// Revert undoes the effect on document using captured deltas (reverse order).
+func (d Diff) Revert(document any) (any, error) {
+	return ApplyInPlace(document, d.reverse)
+}
+
+func isRootPath(path string) bool {
+	p, err := jsonpointer.New(path)
+	if err != nil {
+		return false
+	}
+	return len(p) == 0
+}
+
+// isParentArray is no longer needed since reverse is precompiled in Prepare.
+
+// Prepare builds a Diff by simulating applying patch to original without mutating original.
+// The returned Diff captures concrete, reproducible deltas (including resolving "-" array paths)
+// that can be applied to reproduce the patch effect or reverted to undo it.
+func Prepare(original any, patch Patch) (Diff, error) {
+	// Work on a deep copy so the caller's document is not modified
+	docCopy, err := deepCopyAny(original)
+	if err != nil {
+		return Diff{}, fmt.Errorf("failed to deepcopy original: %w", err)
+	}
+
+	var deltas []Delta
+
+	for _, op := range patch {
+		switch op.Op {
+		case Add:
+			// Resolve concrete path (handle "-" for arrays)
+			resolvedPath, err := resolveConcreteAddPath(docCopy, op.Path)
+			if err != nil {
+				return Diff{}, fmt.Errorf("add resolve path failed: %w", err)
+			}
+			existedBefore, beforeVal, err := tryGetDeep(docCopy, resolvedPath)
+			if err != nil {
+				return Diff{}, fmt.Errorf("add read before failed: %w", err)
+			}
+			afterVal, err := deepCopyAny(op.Value)
+			if err != nil {
+				return Diff{}, fmt.Errorf("add deepcopy value failed: %w", err)
+			}
+			deltas = append(deltas, Delta{
+				Path:          resolvedPath,
+				Op:            Add,
+				Before:        beforeVal,
+				After:         afterVal,
+				ExistedBefore: existedBefore,
+				ExistedAfter:  true,
+			})
+
+			// Apply to working document using the original (possibly "-"-containing) path
+			docCopy, err = applyAdd(docCopy, op.Path, op.Value)
+			if err != nil {
+				return Diff{}, fmt.Errorf("apply add failed: %w", err)
+			}
+
+		case Remove:
+			// Capture existing value
+			beforeValRaw, err := jsonpointer.Get(docCopy, op.Path)
+			if err != nil {
+				return Diff{}, fmt.Errorf("remove get before failed: %w", err)
+			}
+			beforeVal, err := deepCopyAny(beforeValRaw)
+			if err != nil {
+				return Diff{}, fmt.Errorf("remove deepcopy failed: %w", err)
+			}
+			deltas = append(deltas, Delta{
+				Path:          op.Path,
+				Op:            Remove,
+				Before:        beforeVal,
+				ExistedBefore: true,
+				ExistedAfter:  false,
+			})
+
+			docCopy, err = applyRemove(docCopy, op.Path)
+			if err != nil {
+				return Diff{}, fmt.Errorf("apply remove failed: %w", err)
+			}
+
+		case Replace:
+			// Replace must exist; capture before and after
+			beforeValRaw, err := jsonpointer.Get(docCopy, op.Path)
+			if err != nil {
+				return Diff{}, fmt.Errorf("replace get before failed: %w", err)
+			}
+			beforeVal, err := deepCopyAny(beforeValRaw)
+			if err != nil {
+				return Diff{}, fmt.Errorf("replace deepcopy before failed: %w", err)
+			}
+			afterVal, err := deepCopyAny(op.Value)
+			if err != nil {
+				return Diff{}, fmt.Errorf("replace deepcopy after failed: %w", err)
+			}
+			deltas = append(deltas, Delta{
+				Path:          op.Path,
+				Op:            Replace,
+				Before:        beforeVal,
+				After:         afterVal,
+				ExistedBefore: true,
+				ExistedAfter:  true,
+			})
+
+			docCopy, err = applyReplace(docCopy, op.Path, op.Value)
+			if err != nil {
+				return Diff{}, fmt.Errorf("apply replace failed: %w", err)
+			}
+
+		case Move:
+			// Move is copy then remove with respect to deltas (capture using pre-state)
+			valRaw, err := jsonpointer.Get(docCopy, op.From)
+			if err != nil {
+				return Diff{}, fmt.Errorf("move get source failed: %w", err)
+			}
+			valCopy, err := deepCopyAny(valRaw)
+			if err != nil {
+				return Diff{}, fmt.Errorf("move deepcopy source failed: %w", err)
+			}
+			resolvedDest, err := resolveConcreteAddPath(docCopy, op.Path)
+			if err != nil {
+				return Diff{}, fmt.Errorf("move resolve dest failed: %w", err)
+			}
+			destExisted, destBefore, err := tryGetDeep(docCopy, resolvedDest)
+			if err != nil {
+				return Diff{}, fmt.Errorf("move get dest before failed: %w", err)
+			}
+
+			// Add at destination first
+			deltas = append(deltas, Delta{
+				Path:          resolvedDest,
+				Op:            Add,
+				Before:        destBefore,
+				After:         valCopy,
+				ExistedBefore: destExisted,
+				ExistedAfter:  true,
+			})
+			// Then remove from source
+			deltas = append(deltas, Delta{
+				Path:          op.From,
+				Op:            Remove,
+				Before:        valCopy,
+				ExistedBefore: true,
+				ExistedAfter:  false,
+			})
+
+			docCopy, err = applyMove(docCopy, op.From, op.Path)
+			if err != nil {
+				return Diff{}, fmt.Errorf("apply move failed: %w", err)
+			}
+
+		case Copy:
+			valRaw, err := jsonpointer.Get(docCopy, op.From)
+			if err != nil {
+				return Diff{}, fmt.Errorf("copy get source failed: %w", err)
+			}
+			valCopy, err := deepCopyAny(valRaw)
+			if err != nil {
+				return Diff{}, fmt.Errorf("copy deepcopy source failed: %w", err)
+			}
+			resolvedDest, err := resolveConcreteAddPath(docCopy, op.Path)
+			if err != nil {
+				return Diff{}, fmt.Errorf("copy resolve dest failed: %w", err)
+			}
+			destExisted, destBefore, err := tryGetDeep(docCopy, resolvedDest)
+			if err != nil {
+				return Diff{}, fmt.Errorf("copy get dest before failed: %w", err)
+			}
+
+			deltas = append(deltas, Delta{
+				Path:          resolvedDest,
+				Op:            Add,
+				Before:        destBefore,
+				After:         valCopy,
+				ExistedBefore: destExisted,
+				ExistedAfter:  true,
+			})
+
+			docCopy, err = applyCopy(docCopy, op.From, op.Path)
+			if err != nil {
+				return Diff{}, fmt.Errorf("apply copy failed: %w", err)
+			}
+
+		case Test:
+			if err := applyTest(docCopy, op.Path, op.Value); err != nil {
+				return Diff{}, fmt.Errorf("test failed: %w", err)
+			}
+			// No delta recorded
+		default:
+			return Diff{}, fmt.Errorf("unsupported patch operation in prepare: %s", op.Op)
+		}
+	}
+
+	// Precompile forward and reverse patches from the collected deltas
+	var forward Patch
+	for _, delta := range deltas {
+		switch delta.Op {
+		case Add:
+			forward = append(forward, Operation{Op: Add, Path: delta.Path, Value: delta.After})
+		case Remove:
+			forward = append(forward, Operation{Op: Remove, Path: delta.Path})
+		case Replace:
+			forward = append(forward, Operation{Op: Replace, Path: delta.Path, Value: delta.After})
+		default:
+			return Diff{}, fmt.Errorf("unsupported delta op in forward compile: %s", delta.Op)
+		}
+	}
+	var reverse Patch
+	for i := len(deltas) - 1; i >= 0; i-- {
+		delta := deltas[i]
+		if isRootPath(delta.Path) {
+			// Root always restored via replace with Before
+			reverse = append(reverse, Operation{Op: Replace, Path: "", Value: delta.Before})
+			continue
+		}
+		switch delta.Op {
+		case Add:
+			if delta.ExistedBefore {
+				reverse = append(reverse, Operation{Op: Replace, Path: delta.Path, Value: delta.Before})
+			} else {
+				reverse = append(reverse, Operation{Op: Remove, Path: delta.Path})
+			}
+		case Remove:
+			reverse = append(reverse, Operation{Op: Add, Path: delta.Path, Value: delta.Before})
+		case Replace:
+			reverse = append(reverse, Operation{Op: Replace, Path: delta.Path, Value: delta.Before})
+		default:
+			return Diff{}, fmt.Errorf("unsupported delta op in reverse compile: %s", delta.Op)
+		}
+	}
+
+	return Diff{Deltas: deltas, forward: forward, reverse: reverse}, nil
+}
+
+// deepCopyAny performs a JSON round-trip to safely copy arbitrary JSON-like values.
+func deepCopyAny(value any) (any, error) {
+	bytes, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var out any
+	if err := json.Unmarshal(bytes, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// tryGetDeep attempts to get a value at path and returns whether it existed and a deep copy if so.
+func tryGetDeep(document any, path string) (bool, any, error) {
+	val, err := jsonpointer.Get(document, path)
+	if err != nil {
+		return false, nil, nil
+	}
+	cp, err := deepCopyAny(val)
+	if err != nil {
+		return false, nil, err
+	}
+	return true, cp, nil
+}
+
+// resolveConcreteAddPath converts an add path with "-" (array append) into a concrete index path
+// based on the current state of the parent array. If the path does not end with "-", it is returned unchanged.
+func resolveConcreteAddPath(document any, path string) (string, error) {
+	p, err := jsonpointer.New(path)
+	if err != nil {
+		return "", err
+	}
+	if len(p) == 0 {
+		// Root path
+		return path, nil
+	}
+
+	parentPath := jsonpointer.Pointer(p[0 : len(p)-1]).String()
+	token := p[len(p)-1]
+	if token != "-" {
+		return path, nil
+	}
+
+	parent, err := jsonpointer.Get(document, parentPath)
+	if err != nil {
+		return "", fmt.Errorf("parent path '%s' not found for '-': %w", parentPath, err)
+	}
+	arr, ok := parent.([]any)
+	if !ok {
+		return "", fmt.Errorf("path '%s' with '-' is not an array parent", parentPath)
+	}
+	idxStr := strconv.Itoa(len(arr))
+	if parentPath == "" {
+		return "/" + idxStr, nil
+	}
+	return parentPath + "/" + idxStr, nil
+}
 
 // Apply applies a series of JSON Patch operations to a document, returning a new
 // modified document. The original document is not changed.
