@@ -2,9 +2,13 @@ package jsonpatch
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
+	"reflect"
 	"strconv"
+	"strings"
 
 	"github.com/agentflare-ai/go-jsonpointer"
 )
@@ -481,7 +485,8 @@ func applyMove(document any, from, to string) (any, error) {
 		return nil, err
 	}
 
-	return jsonpointer.Set(doc, to, val)
+	// Use add semantics for destination to ensure array insert behavior per RFC6902.
+	return applyAdd(doc, to, val)
 }
 
 func applyCopy(document any, from, to string) (any, error) {
@@ -514,4 +519,708 @@ func applyTest(document any, path string, expected any) error {
 	}
 
 	return nil
+}
+
+// New computes an RFC 6902 JSON Patch that transforms a into b.
+// It accepts []byte, json.RawMessage, or Go values (maps, slices, primitives).
+func New(a, b any) (Patch, error) {
+	na, err := normalizeJSONInput(a)
+	if err != nil {
+		return nil, err
+	}
+	nb, err := normalizeJSONInput(b)
+	if err != nil {
+		return nil, err
+	}
+	return diffValue("", na, nb)
+}
+
+// normalizeJSONInput canonicalizes arbitrary input into encoding/json's standard
+// Go representation: map[string]any, []any, float64, string, bool, nil.
+func normalizeJSONInput(v any) (any, error) {
+	switch tv := v.(type) {
+	case []byte:
+		var out any
+		if err := json.Unmarshal(tv, &out); err != nil {
+			return nil, fmt.Errorf("invalid JSON bytes: %w", err)
+		}
+		return out, nil
+	case json.RawMessage:
+		var out any
+		if err := json.Unmarshal(tv, &out); err != nil {
+			return nil, fmt.Errorf("invalid json.RawMessage: %w", err)
+		}
+		return out, nil
+	default:
+		// Round-trip through JSON to normalize numeric types to float64, etc.
+		return deepCopyAny(tv)
+	}
+}
+
+// escapeToken applies RFC 6901 escaping for '~' and '/' characters.
+func escapeToken(s string) string {
+	s = strings.ReplaceAll(s, "~", "~0")
+	return strings.ReplaceAll(s, "/", "~1")
+}
+
+// joinPath concatenates RFC 6901 tokens onto a JSON Pointer path.
+func joinPath(base, token string) string {
+	if base == "" {
+		return "/" + escapeToken(token)
+	}
+	return base + "/" + escapeToken(token)
+}
+
+func diffValue(path string, a, b any) (Patch, error) {
+	// If fully equal, no ops.
+	if reflect.DeepEqual(a, b) {
+		return nil, nil
+	}
+
+	// Object vs Object
+	if ma, ok := a.(map[string]any); ok {
+		if mb, ok := b.(map[string]any); ok {
+			return diffObject(path, ma, mb)
+		}
+	}
+
+	// Array vs Array
+	if sa, ok := a.([]any); ok {
+		if sb, ok := b.([]any); ok {
+			return diffArray(path, sa, sb)
+		}
+	}
+
+	// Fallback to replace when types differ or primitive mismatch
+	return Patch{
+		{Op: Replace, Path: path, Value: b},
+	}, nil
+}
+
+func diffObject(path string, a, b map[string]any) (Patch, error) {
+	var out Patch
+
+	// Track keys in a
+	for ka := range a {
+		if _, exists := b[ka]; !exists {
+			// Key removed
+			out = append(out, Operation{
+				Op:   Remove,
+				Path: joinPath(path, ka),
+			})
+		}
+	}
+
+	// Keys present in b
+	for kb, vb := range b {
+		if va, exists := a[kb]; exists {
+			// Recurse
+			child, err := diffValue(joinPath(path, kb), va, vb)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, child...)
+			continue
+		}
+		// Key added
+		cpv, err := deepCopyAny(vb)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, Operation{
+			Op:    Add,
+			Path:  joinPath(path, kb),
+			Value: cpv,
+		})
+	}
+
+	return out, nil
+}
+
+// diffArray produces a patch transforming a -> b using an LCS-based edit script.
+// It uses tokenized equality (cached JSON marshal of elements) and emits removes
+// in descending index order followed by adds in ascending index order.
+func diffArray(path string, a, b []any) (Patch, error) {
+	// Precompute tokens
+	atoks, err := tokenizeArray(a)
+	if err != nil {
+		return nil, err
+	}
+	btoks, err := tokenizeArray(b)
+	if err != nil {
+		return nil, err
+	}
+	n := len(atoks)
+	m := len(btoks)
+
+	// Build token -> positions queue for 'a'
+	posMap := make(map[string][]int, n)
+	for i, t := range atoks {
+		posMap[t] = append(posMap[t], i)
+	}
+	type pair struct{ ai, bj int }
+	pairs := make([]pair, 0, min(n, m))
+	seq := make([]int, 0, min(n, m))
+	for j, t := range btoks {
+		q := posMap[t]
+		if len(q) == 0 {
+			continue
+		}
+		ai := q[0]
+		posMap[t] = q[1:]
+		pairs = append(pairs, pair{ai: ai, bj: j})
+		seq = append(seq, ai)
+	}
+
+	// Compute LIS over seq, keeping predecessors to reconstruct indices
+	k := len(seq)
+	tails := make([]int, 0, k) // indices into seq
+	prev := make([]int, k)
+	for i := range prev {
+		prev[i] = -1
+	}
+	for i, v := range seq {
+		lo, hi := 0, len(tails)
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if seq[tails[mid]] < v {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		pos := lo
+		if pos > 0 {
+			prev[i] = tails[pos-1]
+		}
+		if pos == len(tails) {
+			tails = append(tails, i)
+		} else {
+			tails[pos] = i
+		}
+	}
+	lisLen := len(tails)
+	lisIdx := make([]int, lisLen)
+	if lisLen > 0 {
+		p := tails[lisLen-1]
+		for x := lisLen - 1; x >= 0; x-- {
+			lisIdx[x] = p
+			p = prev[p]
+			if p < 0 && x > 0 {
+				break
+			}
+		}
+	}
+
+	keepA := make([]bool, n)
+	keepB := make([]bool, m)
+	for _, idxPair := range lisIdx {
+		ai := pairs[idxPair].ai
+		bj := pairs[idxPair].bj
+		keepA[ai] = true
+		keepB[bj] = true
+	}
+
+	var patch Patch
+	// Removes: descending indices
+	for i := n - 1; i >= 0; i-- {
+		if !keepA[i] {
+			patch = append(patch, Operation{
+				Op:   Remove,
+				Path: joinPath(path, strconv.Itoa(i)),
+			})
+		}
+	}
+	// Adds: ascending indices
+	for j := 0; j < m; j++ {
+		if !keepB[j] {
+			patch = append(patch, Operation{
+				Op:    Add,
+				Path:  joinPath(path, strconv.Itoa(j)),
+				Value: b[j],
+			})
+		}
+	}
+	return patch, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func tokenizeArray(arr []any) ([]string, error) {
+	out := make([]string, len(arr))
+	for i, v := range arr {
+		switch tv := v.(type) {
+		case nil:
+			out[i] = "0"
+		case bool:
+			if tv {
+				out[i] = "b:1"
+			} else {
+				out[i] = "b:0"
+			}
+		case float64:
+			// Normalize -0 to +0 for stable equality
+			if tv == 0 {
+				out[i] = "n:0"
+				continue
+			}
+			out[i] = "n:" + strconv.FormatUint(math.Float64bits(tv), 16)
+		case string:
+			out[i] = "s:" + tv
+		default:
+			// Fallback to canonical JSON for arrays/objects
+			bs, err := json.Marshal(tv)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = "j:" + string(bs)
+		}
+	}
+	return out, nil
+}
+
+// ExtractAdded splits `after` using only Add ops in `patch`.
+// - remaining: `after` with added elements/keys removed (copy-on-write)
+// - addedOnly: partial structure with only the added content
+// Hot path: no JSON serialization; no deep copies of values; only container COW.
+func ExtractAdded(after any, patch Patch) (remaining any, addedOnly any, err error) {
+	// Shallow clone the root so the caller's value is never mutated.
+	switch root := after.(type) {
+	case map[string]any:
+		remaining = shallowCloneMap(root)
+	case []any:
+		remaining = shallowCloneSlice(root)
+	default:
+		// Non-container roots cannot have child adds; return as-is.
+		remaining = after
+	}
+
+	// Group add ops by tokenized parent pointer; preserve op order.
+	type addOp struct {
+		parent jsonpointer.Pointer
+		child  string
+		value  any
+		order  int
+		raw    Operation
+	}
+	groups := make(map[string][]addOp)
+	parentByKey := make(map[string]jsonpointer.Pointer)
+	for i, op := range patch {
+		if op.Op != Add {
+			continue
+		}
+		// Root replacement is not considered an addition for extraction.
+		if op.Path == "" {
+			return nil, nil, fmt.Errorf("jsonpatch: root-level add is not supported by ExtractAdded")
+		}
+		tokens, perr := jsonpointer.New(op.Path)
+		if perr != nil {
+			return nil, nil, perr
+		}
+		if len(tokens) == 0 {
+			return nil, nil, fmt.Errorf("jsonpatch: invalid empty path in add")
+		}
+		parent := jsonpointer.Pointer(tokens[:len(tokens)-1])
+		child := tokens[len(tokens)-1]
+		key := parent.String()
+		groups[key] = append(groups[key], addOp{
+			parent: parent,
+			child:  child,
+			value:  op.Value,
+			order:  i,
+			raw:    op,
+		})
+		parentByKey[key] = parent
+	}
+
+	// Nothing to extract.
+	if len(groups) == 0 {
+		return remaining, nil, nil
+	}
+
+	// Sort parent keys by depth (token length) to have deterministic order.
+	type parentEntry struct {
+		key    string
+		tokens jsonpointer.Pointer
+	}
+	orderParents := make([]parentEntry, 0, len(groups))
+	for k, p := range parentByKey {
+		orderParents = append(orderParents, parentEntry{key: k, tokens: p})
+	}
+	// Shallow-first or deep-first both work when we COW from current remaining.
+	// Use shallow-first (shorter paths first) for readability.
+	for i := 0; i < len(orderParents)-1; i++ {
+		for j := i + 1; j < len(orderParents); j++ {
+			if len(orderParents[i].tokens) > len(orderParents[j].tokens) {
+				orderParents[i], orderParents[j] = orderParents[j], orderParents[i]
+			}
+		}
+	}
+
+	// Process each parent group.
+	for _, pe := range orderParents {
+		parentTokens := pe.tokens
+		ops := groups[pe.key]
+
+		// Resolve parent from 'after' to confirm existence and type, also needed for addedOnly leaf values.
+		parentAfter, gerr := parentTokens.Get(after)
+		if gerr != nil {
+			return nil, nil, fmt.Errorf("jsonpatch: parent '%s' not found in after: %w", parentTokens.String(), gerr)
+		}
+
+		switch pa := parentAfter.(type) {
+		case map[string]any:
+			// Object semantics with last-wins per key.
+			final := make(map[string]any, len(ops))
+			seen := make(map[string]struct{}, len(ops))
+			for _, op := range ops {
+				// Only string child tokens valid for object parents.
+				if _, numErr := jsonpointer.ParseArrayIndex(op.child); numErr == nil || op.child == "-" {
+					return nil, nil, fmt.Errorf("jsonpatch: object parent '%s' received array-style add at child '%s'", parentTokens.String(), op.child)
+				}
+				final[op.child] = op.value
+				seen[op.child] = struct{}{}
+			}
+
+			// Build new parent map for remaining by removing the keys (COW).
+			parentRem, gerr := parentTokens.Get(remaining)
+			if gerr != nil {
+				return nil, nil, fmt.Errorf("jsonpatch: parent '%s' not found in remaining: %w", parentTokens.String(), gerr)
+			}
+			pm, ok := parentRem.(map[string]any)
+			if !ok {
+				return nil, nil, fmt.Errorf("jsonpatch: parent '%s' expected object in remaining", parentTokens.String())
+			}
+			newMap := shallowCloneMap(pm)
+			for k := range final {
+				delete(newMap, k)
+			}
+			remaining, err = cowSetAtPath(remaining, parentTokens, newMap)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			// Populate addedOnly branch under same parent path with only the added keys.
+			addedOnly, err = ensureAddedOnlyParent(addedOnly, parentTokens, false)
+			if err != nil {
+				return nil, nil, err
+			}
+			// Fetch the addedOnly parent we just ensured (it must exist and be a map).
+			aoPar, gerr := parentTokens.Get(addedOnly)
+			if gerr != nil {
+				return nil, nil, fmt.Errorf("jsonpatch: failed to get addedOnly parent '%s': %w", parentTokens.String(), gerr)
+			}
+			aoMap, ok := aoPar.(map[string]any)
+			if !ok {
+				return nil, nil, fmt.Errorf("jsonpatch: addedOnly parent '%s' is not object", parentTokens.String())
+			}
+			// Use values from 'after' to ensure leaf references match final document.
+			for k := range final {
+				v, ok := pa[k]
+				if !ok {
+					// Should not happen if patch/after are consistent.
+					aoMap[k] = nil
+					continue
+				}
+				aoMap[k] = v
+			}
+
+		case []any:
+			// Array semantics:
+			// Infer baseLen = len(afterArray) - numberOfAddsToThisParent
+			lAfter := len(pa)
+			numAdds := len(ops)
+			baseLen := lAfter - numAdds
+			if baseLen < 0 {
+				return nil, nil, fmt.Errorf("jsonpatch: invalid baseLen for parent '%s'", parentTokens.String())
+			}
+
+			// Resolve '-' appends and validate numeric indices against baseLen.
+			type idxVal struct {
+				idx   int
+				value any
+				order int
+			}
+			tmp := make([]idxVal, 0, len(ops))
+			appendCount := 0
+			for _, op := range ops {
+				if op.child == "-" {
+					idx := baseLen + appendCount
+					appendCount++
+					tmp = append(tmp, idxVal{idx: idx, value: op.value, order: op.order})
+					continue
+				}
+				// Numeric index must be < baseLen (concrete indices refer to original positions).
+				uidx, ierr := jsonpointer.ParseArrayIndex(op.child)
+				if ierr != nil {
+					return nil, nil, fmt.Errorf("jsonpatch: array parent '%s' child '%s' is not numeric nor '-': %v", parentTokens.String(), op.child, ierr)
+				}
+				if int(uidx) >= baseLen {
+					return nil, nil, fmt.Errorf("jsonpatch: array parent '%s' child index %d >= baseLen %d", parentTokens.String(), uidx, baseLen)
+				}
+				tmp = append(tmp, idxVal{idx: int(uidx), value: op.value, order: op.order})
+			}
+			// Last-wins per final index.
+			final := make(map[int]idxVal, len(tmp))
+			for _, it := range tmp {
+				final[it.idx] = it
+			}
+			// Validate reconstructed range bounds
+			if len(final) > 0 {
+				maxIdx := -1
+				for idx := range final {
+					if idx > maxIdx {
+						maxIdx = idx
+					}
+				}
+				if maxIdx >= baseLen+appendCount {
+					return nil, nil, fmt.Errorf("jsonpatch: resolved index %d outside reconstructed range (0..%d) for parent '%s'", maxIdx, baseLen+appendCount-1, parentTokens.String())
+				}
+			}
+
+			// Build new parent slice for remaining by filtering out indices.
+			parentRem, gerr := parentTokens.Get(remaining)
+			if gerr != nil {
+				return nil, nil, fmt.Errorf("jsonpatch: parent '%s' not found in remaining: %w", parentTokens.String(), gerr)
+			}
+			ps, ok := parentRem.([]any)
+			if !ok {
+				return nil, nil, fmt.Errorf("jsonpatch: parent '%s' expected array in remaining", parentTokens.String())
+			}
+			// Collect indices to remove in a set.
+			removeSet := make(map[int]struct{}, len(final))
+			for idx := range final {
+				removeSet[idx] = struct{}{}
+			}
+			filtered := make([]any, 0, len(ps)-len(removeSet))
+			for i := 0; i < len(ps); i++ {
+				if _, drop := removeSet[i]; drop {
+					continue
+				}
+				filtered = append(filtered, ps[i])
+			}
+			remaining, err = cowSetAtPath(remaining, parentTokens, filtered)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			// Populate addedOnly branch under same parent path as compact slice in ascending index order.
+			addedOnly, err = ensureAddedOnlyParent(addedOnly, parentTokens, true)
+			if err != nil {
+				return nil, nil, err
+			}
+			// Build ascending list of indices
+			idxs := make([]int, 0, len(final))
+			for idx := range final {
+				idxs = append(idxs, idx)
+			}
+			for i := 0; i < len(idxs)-1; i++ {
+				for j := i + 1; j < len(idxs); j++ {
+					if idxs[i] > idxs[j] {
+						idxs[i], idxs[j] = idxs[j], idxs[i]
+					}
+				}
+			}
+			// Use values from 'after' at those indices to preserve leaf references.
+			values := make([]any, 0, len(idxs))
+			for _, idx := range idxs {
+				if idx < 0 || idx >= len(pa) {
+					return nil, nil, fmt.Errorf("jsonpatch: after array index %d out of bounds for parent '%s'", idx, parentTokens.String())
+				}
+				values = append(values, pa[idx])
+			}
+			// Set compact slice at parent path in addedOnly
+			addedOnly, err = cowSetAtPath(addedOnly, parentTokens, values)
+			if err != nil {
+				return nil, nil, err
+			}
+
+		default:
+			return nil, nil, fmt.Errorf("jsonpatch: parent '%s' must be object or array", parentTokens.String())
+		}
+	}
+
+	return remaining, addedOnly, nil
+}
+
+// cowSetAtPath performs copy-on-write assignment of a value at the given tokenized path.
+// It shallow-clones containers along the path to avoid mutating shared structures.
+func cowSetAtPath(root any, tokens jsonpointer.Pointer, newVal any) (any, error) {
+	// Empty path replaces the root
+	if len(tokens) == 0 {
+		// root replacement is allowed for internal construction
+		return newVal, nil
+	}
+
+	// Build a stack of frames along the path
+	type frame struct {
+		container any
+		isMap     bool
+		key       string
+		isSlice   bool
+		index     int
+	}
+	var stack []frame
+	current := root
+	for i, tok := range tokens {
+		switch c := current.(type) {
+		case map[string]any:
+			child, ok := c[tok]
+			if !ok {
+				return nil, fmt.Errorf("jsonpatch: cowSetAtPath missing key '%s' at segment %d", tok, i)
+			}
+			stack = append(stack, frame{container: c, isMap: true, key: tok})
+			current = child
+		case []any:
+			if tok == "-" {
+				return nil, fmt.Errorf("jsonpatch: cowSetAtPath does not accept '-' in path")
+			}
+			uidx, err := jsonpointer.ParseArrayIndex(tok)
+			if err != nil {
+				return nil, fmt.Errorf("jsonpatch: cowSetAtPath invalid array index '%s' at segment %d: %v", tok, i, err)
+			}
+			if int(uidx) >= len(c) {
+				return nil, fmt.Errorf("jsonpatch: cowSetAtPath index %d out of bounds at segment %d", uidx, i)
+			}
+			stack = append(stack, frame{container: c, isSlice: true, index: int(uidx)})
+			current = c[uidx]
+		default:
+			return nil, fmt.Errorf("jsonpatch: cowSetAtPath encountered non-container at segment %d", i)
+		}
+	}
+
+	updated := newVal
+	for i := len(stack) - 1; i >= 0; i-- {
+		fr := stack[i]
+		if fr.isMap {
+			orig := fr.container.(map[string]any)
+			cp := shallowCloneMap(orig)
+			cp[fr.key] = updated
+			updated = cp
+			continue
+		}
+		if fr.isSlice {
+			orig := fr.container.([]any)
+			cp := shallowCloneSlice(orig)
+			cp[fr.index] = updated
+			updated = cp
+			continue
+		}
+		return nil, errors.New("jsonpatch: cowSetAtPath invalid frame")
+	}
+	return updated, nil
+}
+
+// ensureAddedOnlyParent creates missing intermediate containers along tokens in the addedOnly tree.
+// It only supports object (map) intermediates. The final container is created as a map or slice depending on wantArray.
+func ensureAddedOnlyParent(root any, tokens jsonpointer.Pointer, wantArray bool) (any, error) {
+	// If root is nil, initialize as appropriate container for first token chain.
+	if len(tokens) == 0 {
+		if wantArray {
+			return []any{}, nil
+		}
+		return map[string]any{}, nil
+	}
+	var out any = root
+	if out == nil {
+		out = map[string]any{}
+	}
+	current := out
+	for i, tok := range tokens {
+		last := i == len(tokens)-1
+		switch c := current.(type) {
+		case map[string]any:
+			child, ok := c[tok]
+			if !ok {
+				// Create container
+				var created any
+				if last {
+					if wantArray {
+						created = []any{}
+					} else {
+						created = map[string]any{}
+					}
+				} else {
+					created = map[string]any{}
+				}
+				// COW assign into the map
+				cp := shallowCloneMap(c)
+				cp[tok] = created
+				current = created
+				// Rebuild out root up to here
+				head := jsonpointer.Pointer(tokens[:i])
+				var err error
+				out, err = cowSetAtPath(out, head, cp)
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			// If existing child type mismatches requested final, replace only at last step
+			if last {
+				switch child.(type) {
+				case []any:
+					if wantArray {
+						current = child
+						continue
+					}
+				case map[string]any:
+					if !wantArray {
+						current = child
+						continue
+					}
+				}
+				// Replace with desired type
+				var desired any
+				if wantArray {
+					desired = []any{}
+				} else {
+					desired = map[string]any{}
+				}
+				cp := shallowCloneMap(c)
+				cp[tok] = desired
+				head := jsonpointer.Pointer(tokens[:i])
+				var err error
+				out, err = cowSetAtPath(out, head, cp)
+				if err != nil {
+					return nil, err
+				}
+				current = desired
+				continue
+			}
+			// Continue walking
+			current = child
+		case []any:
+			// Not supported to auto-create through array indices in addedOnly path.
+			return nil, fmt.Errorf("jsonpatch: ensureAddedOnlyParent does not support array indices in intermediate path at segment %d", i)
+		default:
+			return nil, fmt.Errorf("jsonpatch: ensureAddedOnlyParent encountered non-container at segment %d", i)
+		}
+	}
+	return out, nil
+}
+
+func shallowCloneMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	cp := make(map[string]any, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+func shallowCloneSlice(s []any) []any {
+	if s == nil {
+		return nil
+	}
+	cp := make([]any, len(s))
+	copy(cp, s)
+	return cp
 }
